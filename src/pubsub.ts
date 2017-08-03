@@ -87,7 +87,7 @@ export interface TriggerMap {
 }
 
 export interface SetupFunction {
-    (options: SubscriptionOptions, args: {[key: string]: any}, subscriptionName: string): TriggerMap;
+    (options: SubscriptionOptions, args: {[key: string]: any}, subscriptionName: string): TriggerMap | Promise<TriggerMap>;
 }
 
 export interface SetupFunctions {
@@ -117,7 +117,7 @@ export class SubscriptionManager {
     }
 
     public subscribe(options: SubscriptionOptions): Promise<number> {
-
+        console.log("subscribed called");
         // 1. validate the query, operationName and variables
         const parsedQuery = parse(options.query);
         const errors = validate(
@@ -147,68 +147,73 @@ export class SubscriptionManager {
             }
         });
 
-        let triggerMap: TriggerMap;
+        let setupFunctionReturn;
 
         if (this.setupFunctions[subscriptionName]) {
-            triggerMap = this.setupFunctions[subscriptionName](options, args, subscriptionName);
+             setupFunctionReturn = Promise.resolve(this.setupFunctions[subscriptionName](options, args, subscriptionName));
         } else {
             // if not provided, the triggerName will be the subscriptionName, The trigger will not have any
             // options and rely on defaults that are set later.
-            triggerMap = {[subscriptionName]: {}};
+            setupFunctionReturn = Promise.resolve({[subscriptionName]: {}});
         }
 
-        const externalSubscriptionId = this.maxSubscriptionId++;
-        this.subscriptions[externalSubscriptionId] = [];
-        const subscriptionPromises = [];
-        Object.keys(triggerMap).forEach( triggerName => {
-            // Deconstruct the trigger options and set any defaults
-            const {
-                channelOptions = {},
-                filter = () => true, // Let all messages through by default.
-            } = triggerMap[triggerName];
+        return setupFunctionReturn.then((map) => {
+            const triggerMap = map;
+            const externalSubscriptionId = this.maxSubscriptionId++;
+            this.subscriptions[externalSubscriptionId] = [];
+            const subscriptionPromises = [];
+            Object.keys(triggerMap).forEach( triggerName => {
+                // Deconstruct the trigger options and set any defaults
+                const {
+                    channelOptions = {},
+                    filter,
+                } = triggerMap[triggerName];
 
-            // 2. generate the handler function
-            //
-            // rootValue is the payload sent by the event emitter / trigger by
-            // convention this is the value returned from the mutation
-            // resolver
-            const onMessage = (rootValue) => {
-                return Promise.resolve().then(() => {
-                    if (typeof options.context === 'function') {
-                        return options.context();
-                    }
-                    return options.context;
-                }).then((context) => {
-                    return Promise.all([
-                        context,
-                        filter(rootValue, context),
-                    ]);
-                }).then(([context, doExecute]) => {
-                  if (!doExecute) {
-                    return;
-                  }
-                  execute(
-                      this.schema,
-                      parsedQuery,
-                      rootValue,
-                      context,
-                      options.variables,
-                      options.operationName
-                  ).then( data => options.callback(null, data) );
-                }).catch((error) => {
-                    options.callback(error);
-                });
-            }
+                // 2. generate the handler function
+                //
+                // rootValue is the payload sent by the event emitter / trigger by
+                // convention this is the value returned from the mutation
+                // resolver
+                const onMessage = (rootValue) => {
+                    return Promise.resolve().then(() => {
+                        if (typeof options.context === 'function') {
+                            return options.context();
+                        }
+                        return options.context;
+                    }).then((context) => {
+                        if (!filter) {
+                          return Promise.all([context, true]);
+                        }
+                        return Promise.all([
+                            context,
+                            filter(rootValue, context),
+                        ]);
+                    }).then(([context, doExecute]) => {
+                      if (!doExecute) {
+                        return;
+                      }
+                      execute(
+                          this.schema,
+                          parsedQuery,
+                          rootValue,
+                          context,
+                          options.variables,
+                          options.operationName
+                      ).then( data => options.callback(null, data) );
+                    }).catch((error) => {
+                        options.callback(error);
+                    });
+                }
 
-            // 3. subscribe and keep the subscription id
-            subscriptionPromises.push(
-                this.pubsub.subscribe(triggerName, onMessage, channelOptions)
-                    .then(id => this.subscriptions[externalSubscriptionId].push(id))
-            );
-        });
-
-        // Resolve the promise with external sub id only after all subscriptions completed
-        return Promise.all(subscriptionPromises).then(() => externalSubscriptionId);
+                // 3. subscribe and keep the subscription id
+                subscriptionPromises.push(
+                    this.pubsub.subscribe(triggerName, onMessage, channelOptions)
+                        .then(id => this.subscriptions[externalSubscriptionId].push(id))
+                );
+          });
+          // Resolve the promise with external sub id only after all subscriptions completed
+          return Promise.all(subscriptionPromises).then(() => externalSubscriptionId);
+        }).then((results) => results);
     }
 
     public unsubscribe(subId){
